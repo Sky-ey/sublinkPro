@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -211,6 +212,203 @@ func performClientRequest(t *testing.T, method, path string) *httptest.ResponseR
 	ginContext.Request = httptest.NewRequestWithContext(context.Background(), method, path, nil)
 	GetClient(ginContext)
 	return recorder
+}
+
+func mustJSON(t *testing.T, value any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal json: %v", err)
+	}
+	return string(data)
+}
+
+func createClashRenderSub(t *testing.T, name, nodeNameRule string, nodes []models.Node) models.Subcription {
+	t.Helper()
+
+	clashTemplatePath := writeTestClashTemplate(t)
+	config := protocol.OutputConfig{Clash: clashTemplatePath}
+	sub := models.Subcription{
+		Name:                  name,
+		Config:                mustJSON(t, config),
+		NodeNameRule:          nodeNameRule,
+		RefreshUsageOnRequest: false,
+	}
+	if err := sub.Add(); err != nil {
+		t.Fatalf("add subscription %s: %v", name, err)
+	}
+
+	for i := range nodes {
+		if nodes[i].Link == "" {
+			nodes[i].Link = "ss://YWVzLTEyOC1nY206cGFzc0BleGFtcGxlLmNvbTo0NDM=#" + nodes[i].LinkName
+		}
+		if nodes[i].Protocol == "" {
+			nodes[i].Protocol = "ss"
+		}
+		if nodes[i].Source == "" {
+			nodes[i].Source = "manual"
+		}
+		if err := nodes[i].Add(); err != nil {
+			t.Fatalf("add node %s: %v", nodes[i].LinkName, err)
+		}
+	}
+	sub.Nodes = nodes
+	return sub
+}
+
+func renderClashForTest(t *testing.T, sub models.Subcription) string {
+	t.Helper()
+
+	utils.SetProtocolLinkFuncs(protocol.GetProtocolLabelFromLink, protocol.RenameNodeLink)
+	t.Cleanup(func() {
+		utils.SetProtocolLinkFuncs(nil, nil)
+	})
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ginContext, _ := gin.CreateTestContext(recorder)
+	ginContext.Request = httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/c/?client=clash", nil)
+
+	renderPreparedClash(ginContext, preparedClientResponse{
+		ClientType:   "clash",
+		Mode:         clientResponseNormal,
+		SubName:      sub.Name,
+		Subscription: sub,
+	})
+
+	return recorder.Body.String()
+}
+
+func TestRenderPreparedClashResolvesNodeDialerProxyAfterRename(t *testing.T) {
+	setupClientsAPITestDB(t)
+
+	sub := createClashRenderSub(t, "direct-dialer-rename", "$Name-renamed", []models.Node{
+		{
+			Name:     "entry-remark",
+			LinkName: "entry-link",
+		},
+		{
+			Name:            "target-remark",
+			LinkName:        "target-link",
+			DialerProxyName: "entry-link",
+		},
+		{
+			Name:            "group-target-remark",
+			LinkName:        "group-target-link",
+			DialerProxyName: "manual-group",
+		},
+	})
+
+	body := renderClashForTest(t, sub)
+
+	if !strings.Contains(body, "name: entry-link-renamed") {
+		t.Fatalf("expected renamed entry proxy in clash output, got:\n%s", body)
+	}
+	if !strings.Contains(body, "name: target-link-renamed") {
+		t.Fatalf("expected renamed target proxy in clash output, got:\n%s", body)
+	}
+	if !strings.Contains(body, "dialer-proxy: entry-link-renamed") {
+		t.Fatalf("expected node dialer-proxy to use renamed entry name, got:\n%s", body)
+	}
+	if strings.Contains(body, "dialer-proxy: entry-link\n") {
+		t.Fatalf("expected raw entry dialer-proxy name to be resolved, got:\n%s", body)
+	}
+	if !strings.Contains(body, "dialer-proxy: manual-group") {
+		t.Fatalf("expected non-node dialer-proxy group name to remain unchanged, got:\n%s", body)
+	}
+}
+
+func TestRenderPreparedClashResolvesSpecifiedChainProxyAfterRename(t *testing.T) {
+	setupClientsAPITestDB(t)
+
+	sub := createClashRenderSub(t, "specified-chain-rename", "$Name-renamed", []models.Node{
+		{
+			Name:     "entry-remark",
+			LinkName: "entry-link",
+		},
+		{
+			Name:            "target-remark",
+			LinkName:        "target-link",
+			DialerProxyName: "stale-entry-name",
+		},
+	})
+	entryNode := sub.Nodes[0]
+	targetNode := sub.Nodes[1]
+	rule := models.SubscriptionChainRule{
+		SubscriptionID: sub.ID,
+		Name:           "specified entry",
+		Enabled:        true,
+		ChainConfig: mustJSON(t, []models.ChainProxyItem{
+			{Type: "specified_node", NodeID: entryNode.ID},
+		}),
+		TargetConfig: mustJSON(t, models.TargetConfig{
+			Type:   "specified_node",
+			NodeID: targetNode.ID,
+		}),
+	}
+	if err := rule.Add(); err != nil {
+		t.Fatalf("add chain rule: %v", err)
+	}
+
+	body := renderClashForTest(t, sub)
+
+	if !strings.Contains(body, "dialer-proxy: entry-link-renamed") {
+		t.Fatalf("expected chain target dialer-proxy to use renamed specified node, got:\n%s", body)
+	}
+	if strings.Contains(body, "dialer-proxy: stale-entry-name") {
+		t.Fatalf("expected chain target dialer-proxy to override node-level dialer-proxy, got:\n%s", body)
+	}
+}
+
+func TestRenderPreparedClashResolvesMultiHopChainDialersAfterRename(t *testing.T) {
+	setupClientsAPITestDB(t)
+
+	sub := createClashRenderSub(t, "multi-hop-chain-rename", "$Name-out", []models.Node{
+		{
+			Name:     "entry-remark",
+			LinkName: "entry-link",
+		},
+		{
+			Name:     "middle-remark",
+			LinkName: "middle-link",
+		},
+		{
+			Name:            "target-remark",
+			LinkName:        "target-link",
+			DialerProxyName: "legacy-group",
+		},
+	})
+	entryNode := sub.Nodes[0]
+	middleNode := sub.Nodes[1]
+	targetNode := sub.Nodes[2]
+	rule := models.SubscriptionChainRule{
+		SubscriptionID: sub.ID,
+		Name:           "multi hop",
+		Enabled:        true,
+		ChainConfig: mustJSON(t, []models.ChainProxyItem{
+			{Type: "specified_node", NodeID: entryNode.ID},
+			{Type: "specified_node", NodeID: middleNode.ID},
+		}),
+		TargetConfig: mustJSON(t, models.TargetConfig{
+			Type:   "specified_node",
+			NodeID: targetNode.ID,
+		}),
+	}
+	if err := rule.Add(); err != nil {
+		t.Fatalf("add chain rule: %v", err)
+	}
+
+	body := renderClashForTest(t, sub)
+
+	if !strings.Contains(body, "dialer-proxy: entry-link-out") {
+		t.Fatalf("expected middle hop dialer-proxy to use renamed entry name, got:\n%s", body)
+	}
+	if !strings.Contains(body, "dialer-proxy: middle-link-out") {
+		t.Fatalf("expected target dialer-proxy to use renamed middle name, got:\n%s", body)
+	}
+	if strings.Contains(body, "dialer-proxy: legacy-group") {
+		t.Fatalf("expected chain target dialer-proxy to override node-level fallback, got:\n%s", body)
+	}
 }
 
 func TestRenderPreparedV2raySkipsProtocolUnsupportedLinks(t *testing.T) {

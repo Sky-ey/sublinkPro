@@ -356,6 +356,54 @@ func buildRenamedNodeLink(node models.Node, processedLinkName, nodeNameRule, lin
 	return utils.RenameNodeLink(link, newName)
 }
 
+func buildClashNodeNameResolution(nodes []models.Node, nodeNamePreprocess, nodeNameRule string) (map[int]string, map[string]string) {
+	nodeNameMap := make(map[int]string, len(nodes))
+	aliasToFinalName := make(map[string]string, len(nodes)*3)
+	ambiguousAliases := make(map[string]bool)
+
+	addAlias := func(alias, finalName string) {
+		alias = strings.TrimSpace(alias)
+		if alias == "" || ambiguousAliases[alias] {
+			return
+		}
+		if existing, exists := aliasToFinalName[alias]; exists {
+			if existing != finalName {
+				delete(aliasToFinalName, alias)
+				ambiguousAliases[alias] = true
+			}
+			return
+		}
+		aliasToFinalName[alias] = finalName
+	}
+
+	for idx, node := range nodes {
+		processedLinkName := utils.PreprocessNodeName(nodeNamePreprocess, node.LinkName)
+		finalName := node.EffectiveName()
+		if nodeNameRule != "" {
+			finalName = utils.RenameNode(nodeNameRule, models.BuildNodeRenameInfo(node, processedLinkName, protocol.GetProtocolFromLink(node.Link), idx+1))
+		}
+		finalName = strings.TrimSpace(finalName)
+		nodeNameMap[node.ID] = finalName
+
+		addAlias(node.EffectiveName(), finalName)
+		addAlias(node.Name, finalName)
+		addAlias(node.LinkName, finalName)
+	}
+
+	return nodeNameMap, aliasToFinalName
+}
+
+func resolveClashDialerProxyName(name string, aliasToFinalName map[string]string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	if finalName, ok := aliasToFinalName[name]; ok {
+		return finalName
+	}
+	return name
+}
+
 func buildSurgeRenameInfo(node models.Node, processedLinkName, link string, index int) utils.NodeInfo {
 	return utils.NodeInfo{
 		Name:          node.EffectiveName(),
@@ -533,17 +581,8 @@ func renderPreparedClash(c *gin.Context, prepared preparedClientResponse) {
 	// 获取链式代理规则
 	chainRules := models.GetEnabledChainRulesBySubscriptionID(sub.ID)
 
-	// 构建节点ID到最终名称的映射（用于链式代理规则解析）
-	nodeNameMap := make(map[int]string)
-	for idx, v := range sub.Nodes {
-		// 计算节点最终名称
-		processedLinkName := utils.PreprocessNodeName(sub.NodeNamePreprocess, v.LinkName)
-		finalName := v.EffectiveName() // 默认使用节点名称模式计算后的实际名称
-		if sub.NodeNameRule != "" {
-			finalName = utils.RenameNode(sub.NodeNameRule, models.BuildNodeRenameInfo(v, processedLinkName, protocol.GetProtocolFromLink(v.Link), idx+1))
-		}
-		nodeNameMap[v.ID] = finalName
-	}
+	// 构建节点 ID 到最终输出名称的映射，并保留旧名称到最终名称的无歧义别名映射。
+	nodeNameMap, aliasToFinalName := buildClashNodeNameResolution(sub.Nodes, sub.NodeNamePreprocess, sub.NodeNameRule)
 
 	// 收集自定义代理组
 	customGroups := models.CollectCustomProxyGroups(chainRules, sub.Nodes, nodeNameMap)
@@ -560,21 +599,21 @@ func renderPreparedClash(c *gin.Context, prepared preparedClientResponse) {
 			chainResult := models.ApplyChainRulesToNodeV2(v, chainRules, sub.Nodes, nodeNameMap)
 			if chainResult != nil && chainResult.FinalDialer != "" {
 				// 记录目标节点的 dialer-proxy
-				targetNodeDialerMap[v.ID] = chainResult.FinalDialer
+				targetNodeDialerMap[v.ID] = resolveClashDialerProxyName(chainResult.FinalDialer, aliasToFinalName)
 				// 收集链路中间节点的 dialer-proxy 映射
 				for _, link := range chainResult.Links {
 					// 只处理非代理组类型的中间节点（代理组类型的 dialer-proxy 由组本身处理）
 					if !link.IsGroup && link.DialerProxy != "" {
 						// 如果同一节点在多个规则中作为中间节点，使用最先匹配的
 						if _, exists := chainNodeDialerMap[link.ProxyName]; !exists {
-							chainNodeDialerMap[link.ProxyName] = link.DialerProxy
+							chainNodeDialerMap[link.ProxyName] = resolveClashDialerProxyName(link.DialerProxy, aliasToFinalName)
 						}
 					}
 				}
 				// 收集中间节点自定义代理组内节点的 dialer-proxy 映射
 				for memberName, dialerProxy := range chainResult.GroupMemberDialerMap {
 					if _, exists := chainNodeDialerMap[memberName]; !exists {
-						chainNodeDialerMap[memberName] = dialerProxy
+						chainNodeDialerMap[memberName] = resolveClashDialerProxyName(dialerProxy, aliasToFinalName)
 					}
 				}
 			}
@@ -590,7 +629,7 @@ func renderPreparedClash(c *gin.Context, prepared preparedClientResponse) {
 		nodeLink := buildRenamedNodeLink(v, processedLinkName, sub.NodeNameRule, v.Link, idx+1)
 
 		// 计算 dialer-proxy（链式代理规则）
-		dialerProxy := strings.TrimSpace(v.DialerProxyName)
+		dialerProxy := resolveClashDialerProxyName(v.DialerProxyName, aliasToFinalName)
 
 		// 优先级：中间节点映射 > 目标节点映射 > 节点自身设置
 		finalNodeName := nodeNameMap[v.ID]
@@ -598,7 +637,7 @@ func renderPreparedClash(c *gin.Context, prepared preparedClientResponse) {
 		// 检查是否作为链路中间节点（最高优先级）
 		if chainDialer, exists := chainNodeDialerMap[finalNodeName]; exists {
 			dialerProxy = chainDialer
-		} else if targetDialer, exists := targetNodeDialerMap[v.ID]; exists && dialerProxy == "" {
+		} else if targetDialer, exists := targetNodeDialerMap[v.ID]; exists {
 			// 作为目标节点
 			dialerProxy = targetDialer
 		}
